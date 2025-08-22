@@ -1,0 +1,11 @@
+[project]
+name = "fireworks-identity-verification"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fireworks-ai>=0.19.18",
+    "pydantic>=2.11.7",
+    "python-dotenv>=1.1.1",
+]
