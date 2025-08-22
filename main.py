@@ -19,6 +19,8 @@ from enum import Enum
 from pathlib import Path
 import logging
 import argparse
+import time
+import random
 
 from dotenv import load_dotenv
 
@@ -72,6 +74,13 @@ LOG_PREVIEW_LENGTH = 200
 SUPPORTED_IMAGE_FORMATS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
 CACHE_DIR = "cache"
 ENABLE_CACHE = True
+
+# Rate Limiting Configuration
+REQUEST_DELAY_SECONDS = float(os.getenv("REQUEST_DELAY_SECONDS", "0.5"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
+BASE_BACKOFF_SECONDS = float(os.getenv("BASE_BACKOFF_SECONDS", "1.0"))
+MAX_BACKOFF_SECONDS = float(os.getenv("MAX_BACKOFF_SECONDS", "16.0"))
+JITTER_ENABLED = os.getenv("JITTER_ENABLED", "true").lower() == "true"
 
 # =====================================================================
 # DATA MODELS (Pydantic Schemas)
@@ -283,7 +292,8 @@ class DocumentProcessor:
                 return DocumentType(cached_type['document_type'])
         
         try:
-            response = self.client.chat.completions.create(
+            response = api_request_with_retry(
+                self.client.chat.completions.create,
                 model=VISION_MODEL,
                 messages=[{
                     "role": "user",
@@ -386,7 +396,8 @@ class DocumentProcessor:
         prompt = prompts.get(doc_type, prompts[DocumentType.UNKNOWN])
         
         try:
-            response = self.client.chat.completions.create(
+            response = api_request_with_retry(
+                self.client.chat.completions.create,
                 model=VISION_MODEL,
                 messages=[{
                     "role": "user",
@@ -493,7 +504,8 @@ class DocumentProcessor:
         Return ONLY valid JSON in the same format as the examples above. Use null for missing fields."""
         
         try:
-            response = self.client.chat.completions.create(
+            response = api_request_with_retry(
+                self.client.chat.completions.create,
                 model=TEXT_MODEL,
                 messages=[
                     {"role": "system", "content": "You are a data structuring assistant. Always return valid JSON."},
@@ -601,14 +613,34 @@ class DocumentProcessor:
         """Synchronous wrapper for document processing"""
         return asyncio.run(self.process_document_async(image_path))
     
-    async def process_batch_async(self, image_paths: List[Union[str, Path]]) -> List[KYCExtractionResult]:
-        """Process multiple documents in parallel"""
-        tasks = [self.process_document_async(path) for path in image_paths]
-        return await asyncio.gather(*tasks, return_exceptions=True)
+    async def process_batch_async(self, image_paths: List[Union[str, Path]], sequential: bool = True) -> List[KYCExtractionResult]:
+        """Process multiple documents either sequentially or in parallel"""
+        if sequential:
+            # Process sequentially to avoid rate limits
+            results = []
+            for i, path in enumerate(image_paths):
+                try:
+                    logger.info(f"Processing batch item {i + 1}/{len(image_paths)}: {path}")
+                    result = await self.process_document_async(path)
+                    results.append(result)
+                    
+                    # Add delay between documents except for the last one
+                    if i < len(image_paths) - 1 and REQUEST_DELAY_SECONDS > 0:
+                        logger.debug(f"Waiting {REQUEST_DELAY_SECONDS}s before next document")
+                        await asyncio.sleep(REQUEST_DELAY_SECONDS)
+                        
+                except Exception as e:
+                    logger.error(f"Error processing {path}: {e}")
+                    results.append(e)
+            return results
+        else:
+            # Original parallel processing (may hit rate limits)
+            tasks = [self.process_document_async(path) for path in image_paths]
+            return await asyncio.gather(*tasks, return_exceptions=True)
     
-    def process_batch(self, image_paths: List[Union[str, Path]]) -> List[KYCExtractionResult]:
+    def process_batch(self, image_paths: List[Union[str, Path]], sequential: bool = True) -> List[KYCExtractionResult]:
         """Synchronous wrapper for batch processing"""
-        return asyncio.run(self.process_batch_async(image_paths))
+        return asyncio.run(self.process_batch_async(image_paths, sequential=sequential))
 
 # =====================================================================
 # COMPLIANCE & AUDIT
@@ -681,6 +713,72 @@ def clear_cache_directory():
     else:
         print(f"📁 Cache directory does not exist: {cache_dir}")
 
+def is_rate_limit_error(error_message: str) -> bool:
+    """Check if the error is a rate limit error"""
+    rate_limit_indicators = [
+        "rate limit exceeded",
+        "too many requests", 
+        "429",
+        "rate_limit",
+        "quota exceeded"
+    ]
+    error_lower = str(error_message).lower()
+    return any(indicator in error_lower for indicator in rate_limit_indicators)
+
+def calculate_backoff_delay(attempt: int) -> float:
+    """Calculate exponential backoff delay with optional jitter"""
+    delay = min(BASE_BACKOFF_SECONDS * (2 ** attempt), MAX_BACKOFF_SECONDS)
+    
+    if JITTER_ENABLED:
+        # Add jitter to prevent thundering herd
+        jitter = random.uniform(0, delay * 0.1)
+        delay += jitter
+    
+    return delay
+
+def api_request_with_retry(func, *args, **kwargs):
+    """Execute API request with retry logic for rate limits"""
+    last_exception = None
+    
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            # Add delay before request (except first attempt)
+            if attempt > 0:
+                delay = calculate_backoff_delay(attempt - 1)
+                logger.info(f"Retrying in {delay:.2f} seconds (attempt {attempt + 1}/{MAX_RETRIES + 1})")
+                time.sleep(delay)
+            elif REQUEST_DELAY_SECONDS > 0:
+                # Small delay even on first request to prevent overwhelming API
+                time.sleep(REQUEST_DELAY_SECONDS)
+            
+            # Execute the function
+            result = func(*args, **kwargs)
+            
+            # Success - log if this was a retry
+            if attempt > 0:
+                logger.info(f"Request succeeded on attempt {attempt + 1}")
+            
+            return result
+            
+        except Exception as e:
+            last_exception = e
+            error_message = str(e)
+            
+            # Check if this is a rate limit error
+            if is_rate_limit_error(error_message):
+                if attempt < MAX_RETRIES:
+                    logger.warning(f"Rate limit hit (attempt {attempt + 1}): {error_message}")
+                    continue
+                else:
+                    logger.error(f"Max retries exceeded for rate limit error: {error_message}")
+            else:
+                # Not a rate limit error, don't retry
+                logger.error(f"Non-retryable error: {error_message}")
+                break
+    
+    # If we get here, all retries failed
+    raise last_exception
+
 def main(no_cache=False):
     """Main execution function for testing the KYC system"""
     
@@ -722,13 +820,17 @@ def main(no_cache=False):
     print("=" * 80)
     print()
     
-    # Process documents
-    for doc_path in test_documents:
+    # Process documents sequentially to avoid rate limits
+    print(f"📊 Processing {len(test_documents)} documents sequentially...")
+    print(f"⏱️  Rate limiting: {REQUEST_DELAY_SECONDS}s delay, {MAX_RETRIES} retries with exponential backoff")
+    print()
+    
+    for i, doc_path in enumerate(test_documents):
         if not doc_path.exists():
             print(f"⚠️  Skipping {doc_path} - file not found")
             continue
         
-        print(f"📄 Processing: {doc_path}")
+        print(f"📄 Processing ({i + 1}/{len(test_documents)}): {doc_path}")
         print("-" * 40)
         
         try:
@@ -757,7 +859,12 @@ def main(no_cache=False):
             # Note: Results displayed above - not saved to disk for security
             
         except Exception as e:
-            print(f"❌ Error processing document: {e}")
+            error_msg = str(e)
+            if is_rate_limit_error(error_msg):
+                print(f"❌ Rate limit error (retries exhausted): {e}")
+                print(f"💡 Try increasing REQUEST_DELAY_SECONDS or reducing batch size")
+            else:
+                print(f"❌ Error processing document: {e}")
         
         print()
     
